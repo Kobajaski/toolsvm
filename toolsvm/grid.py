@@ -1,4 +1,4 @@
-__all__ = ['find_parameters']
+__all__ = ['find_parameters', 'evaluate_svm_classifier']
 
 import os
 import sys
@@ -8,41 +8,74 @@ import numpy as np
 import logging
 import ray
 import concurrent.futures
+import dataclasses
 from itertools import product
 from libsvm import svmutil
 from pygnuplot import gnuplot as pygnuplot
-import pandas as pd
+from typing import NamedTuple
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
 
 
+class GridRange(NamedTuple):
+    begin: float
+    end: float
+    step: float
+
+
+@dataclasses.dataclass
+class GridHyperParameter:
+    log2c: float
+    log2g: float
+    log2p: float
+    rate: float = None
+
+    def __eq__(self, ghp):
+        return (self.log2c, self.log2g, self.log2p) == (ghp.log2c, ghp.log2g, ghp.log2p)
+
+    def __hash__(self):
+        return hash((self.log2c, self.log2g, self.log2p))
+
+    @property
+    def c(self):
+        return 2.0**self.log2c if self.log2c is not None else None
+
+    @property
+    def g(self):
+        return 2.0**self.log2g if self.log2g is not None else None
+
+    @property
+    def p(self):
+        return 2.0**self.log2p if self.log2p is not None else None
+
+
 class GridOption:
 
-    def __init__(self, options):
-        self.fold = 5
-        self.svm_type = options['svm_type']
-        self.c_begin, self.c_end, self.c_step = options['log2c']
-        self.g_begin, self.g_end, self.g_step = options['log2g']
-        self.p_begin, self.p_end, self.p_step = options['log2p']
-        self.grid_with_c = options['c']
-        self.grid_with_g = options['g']
-        self.grid_with_p = options['p'] and self.svm_type in [3, 4]
+    def __init__(self, **options: dict[str, object]):
+        self.fold: int = options["fold"]
+        self.svm_type: int = options['svm_type']
+        self.c_range: GridRange = GridRange(*options['c_range'])
+        self.g_range: GridRange = GridRange(*options['g_range'])
+        self.p_range: GridRange = GridRange(*options['p_range'])
+        self.grid_with_c: bool = options['with_c']
+        self.grid_with_g: bool = options['with_g']
+        self.grid_with_p: bool = options['with_p'] and self.svm_type in [3, 4]
         self.dataset = svmutil.svm_read_problem(options['dataset'])
-        self.dataset_title = os.path.split(options['dataset'])[1]
-        self.out = options['out']
-        self.out_pathname = '{0}.out'.format(self.dataset_title if options['out_pathname'] is None else options['out_pathname'])
-        self.png_pathname = '{0}.png'.format(self.dataset_title if options['out_pathname'] is None else options['out_pathname'])
-        self.resume_pathname = options['resume']
-        self.nb_process = options['nb_process']
-        self.svm_options = " ".join(options['svm_options'])
-        self.with_gnuplot = self.grid_with_c and self.grid_with_g
+        self.dataset_title: str = os.path.split(options['dataset'])[1]
+        self.with_output: bool = options['with_output']
+        self.out_pathname: str = '{0}.out'.format(self.dataset_title if options['out_pathname'] is None else options['out_pathname'])
+        self.png_pathname: str = '{0}.png'.format(self.dataset_title if options['out_pathname'] is None else options['out_pathname'])
+        self.resume_pathname: str = options['resume_pathname']
+        self.svm_options: str = " ".join(options['svm_options'])
+        self.with_gnuplot: bool = self.grid_with_c and self.grid_with_g
+        self.nb_process: int = options['nb_process']
         self.validate_options()
 
     def validate_options(self):
         if not any([self.grid_with_c, self.grid_with_g, self.grid_with_p]):
             raise ValueError('-c , -g and -p should not be disabled simultaneously')
 
-    def evaluate_rate(self, rate, best_rate):
+    def evaluate_rate(self, rate: float, best_rate: float):
         if self.rate_kind == 'rate':
             return rate > best_rate
         return rate < best_rate
@@ -52,16 +85,17 @@ class GridOption:
         return 'mse' if self.svm_type in [3, 4] else 'rate'
 
 
-def redraw(db,best_param,gnuplot,options,to_file=False):
+def redraw(db, best_param, options, to_file=False):
+    gnuplot = pygnuplot.Gnuplot()
+
     if len(db) == 0: return
-    begin_level = round(max(x[2] for x in db)) - 3
+    begin_level = round(max(x.rate for x in db)) - 3
     step_size = 0.5
-    best_log2c,best_log2g,best_rate = best_param
     # if newly obtained c, g, or cv values are the same,
     # then stop redrawing the contour.
-    if all(x[0] == db[0][0]  for x in db): return
-    if all(x[1] == db[0][1]  for x in db): return
-    if all(x[2] == db[0][2]  for x in db): return
+    if all(x.log2c == db[0].log2c for x in db): return
+    if all(x.log2g == db[0].log2g for x in db): return
+    if all(x.rate == db[0].rate for x in db): return
 
     if to_file:
         gnuplot.write(b"set term png transparent small linewidth 2 medium enhanced\n")
@@ -74,8 +108,8 @@ def redraw(db,best_param,gnuplot,options,to_file=False):
         gnuplot.write( b"set term x11\n")
     gnuplot.write(b"set xlabel \"log2(C)\"\n")
     gnuplot.write(b"set ylabel \"log2(gamma)\"\n")
-    gnuplot.write("set xrange [{0}:{1}]\n".format(options.c_begin,options.c_end).encode())
-    gnuplot.write("set yrange [{0}:{1}]\n".format(options.g_begin,options.g_end).encode())
+    gnuplot.write("set xrange [{0}:{1}]\n".format(options.c_range.begin,options.c_range.end).encode())
+    gnuplot.write("set yrange [{0}:{1}]\n".format(options.g_range.begin,options.g_range.end).encode())
     gnuplot.write(b"set contour\n")
     gnuplot.write("set cntrparam levels incremental {0},{1},100\n".format(begin_level,step_size).encode())
     gnuplot.write(b"unset surface\n")
@@ -85,30 +119,30 @@ def redraw(db,best_param,gnuplot,options,to_file=False):
     gnuplot.write(b"unset label\n")
     gnuplot.write("set label \"Best log2(C) = {0}  log2(gamma) = {1}  accuracy = {2}%\" \
                   at screen 0.5,0.85 center\n". \
-                  format(best_log2c, best_log2g, best_rate).encode())
+                  format(best_param.log2c, best_param.log2g, best_param.rate).encode())
     gnuplot.write("set label \"C = {0}  gamma = {1}\""
-                  " at screen 0.5,0.8 center\n".format(2.0**best_log2c, 2.0**best_log2g).encode())
+                  " at screen 0.5,0.8 center\n".format(best_param.c, best_param.g).encode())
     gnuplot.write(b"set key at screen 0.9,0.9\n")
     gnuplot.write(b"splot \"-\" with lines\n")
 
-    db.sort(key = lambda x:(x[0], -x[1]))
+    db.sort(key = lambda x:(x.log2c, -x.log2g))
 
-    prevc = db[0][0]
+    prevc = db[0].log2c
     for line in db:
-        if prevc != line[0]:
+        if prevc != line.log2c:
             gnuplot.write(b"\n")
-            prevc = line[0]
-        gnuplot.write("{0[0]} {0[1]} {0[2]}\n".format(line).encode())
+            prevc = line.log2c
+        gnuplot.write(f"{line.log2c} {line.log2g} {line.rate}\n".encode())
     gnuplot.write(b"e\n")
     gnuplot.write(b"\n") # force g back to prompt when term set failure
-    g.flush()
+    gnuplot.flush()
 
 
-def calculate_jobs(options):
+def calculate_jobs(options: GridOption):
 
-    c_seq = np.random.permutation(np.arange(options.c_begin,options.c_end,options.c_step))
-    g_seq = np.random.permutation(np.arange(options.g_begin,options.g_end,options.g_step))
-    p_seq = np.random.permutation(np.arange(options.p_begin,options.p_end,options.p_step))
+    c_seq = np.random.permutation(np.arange(*options.c_range))
+    g_seq = np.random.permutation(np.arange(*options.g_range))
+    p_seq = np.random.permutation(np.arange(*options.p_range))
 
     if not options.grid_with_c:
         c_seq = [None]
@@ -117,157 +151,143 @@ def calculate_jobs(options):
     if not options.grid_with_p:
         p_seq = [None]
 
-    jobs = product(c_seq, g_seq, p_seq)
-    resumed_jobs = {}
+    jobs = map(lambda x: GridHyperParameter(*x), product(c_seq, g_seq, p_seq))
+    resumed_jobs = tuple()
 
     if options.resume_pathname is None:
         return jobs, resumed_jobs
 
     with open(options.resume_pathname, 'r') as resume:
-        resumed_jobs = {
-            (c, g, p): rate
-            for (c, g, p, rate) in
-            map(
-                lambda x: map(lambda y: float(y) if y else None, x),
-                re.findall(
-                    (
-                        r'(?:log2c=([0-9.-]+) )?'
-                        r'(?:log2g=([0-9.-]+) )?'
-                        r'(?:log2p=([0-9,-]+) )?'
-                        rf'{options.rate_kind}=([0-9.]+)'
-                    ),
-                    resume.read()
-                )
+        resumed_jobs = map(
+            lambda x: GridHyperParameter(*map(lambda y: float(y) if y else None, x)),
+            re.findall(
+                (
+                    r'(?:log2c=([0-9.-]+) )?'
+                    r'(?:log2g=([0-9.-]+) )?'
+                    r'(?:log2p=([0-9,-]+) )?'
+                    rf'{options.rate_kind}=([0-9.]+)'
+                ),
+                resume.read()
             )
-        }
+        )
     return jobs, resumed_jobs
 
 
 @ray.remote
-def evaluate(name, c, g, p, options):
+def evaluate_svm_classifier(name: str, hyperparam: GridHyperParameter, options: GridOption):
     cmdline = ['-q', f'-s {options.svm_type}']
 
     if options.grid_with_c:
-        cmdline.append(f'-c {2.0**c}')
+        cmdline.append(f'-c {hyperparam.c}')
 
     if options.grid_with_g:
-        cmdline.append(f'-g {2.0**g}')
+        cmdline.append(f'-g {hyperparam.g}')
 
     if options.grid_with_p:
-        cmdline.append(f'-p {2.0**p}')
+        cmdline.append(f'-p {hyperparam.p}')
 
     cmdline.append(f'-v {options.fold} {options.svm_options}')
-    return (name, c, g, p, svmutil.svm_train(*options.dataset, " ".join(cmdline)))
+    hyperparam.rate = svmutil.svm_train(*options.dataset, " ".join(cmdline))
+    return (name, hyperparam)
 
 
-def find_parameters(params={}):
+def update_param(hyperparam: GridHyperParameter, best_hyperparam: GridHyperParameter, options: GridOption):
+    if (
+        options.evaluate_rate( hyperparam.rate, best_hyperparam.rate )
+        or (
+            hyperparam.rate == best_hyperparam.rate
+            and hyperparam.log2g == best_hyperparam.log2g
+            and hyperparam.log2p == best_hyperparam.log2p
+            and hyperparam.log2c < hyperparam.log2c
+        )
+    ):
+        best_hyperparam = hyperparam
 
-    def update_param(c, g, p, rate, best_c, best_g, best_p, best_rate, worker, resumed, options):
-        if options.evaluate_rate( rate, best_rate ) or (rate == best_rate and g==best_g  and p == best_p and c < best_c):
-            best_rate, best_c, best_g, best_p = rate, c, g, p
+    return best_hyperparam
 
-        stdout_str = [f'[{worker}] {" ".join(str(x) for x in [c, g, p] if x is not None)} {rate} (best']
+def find_parameters(**params: dict[str, object]):
+
+    def write_param(hyperparam: GridHyperParameter, best_hyperparam: GridHyperParameter, worker: str, resumed: bool, options: GridOption):
+        stdout_str = [f'[{worker}] {" ".join(str(x) for x in [hyperparam.log2c, hyperparam.log2g, hyperparam.log2p] if x is not None)} {hyperparam.rate} (best']
         output_str = []
         if options.grid_with_c:
-            stdout_str.append(f'c={2.0**best_c},')
-            output_str.append(f'log2c={c}')
+            stdout_str.append(f'c={best_hyperparam.c},')
+            output_str.append(f'log2c={hyperparam.log2c}')
 
         if options.grid_with_g:
-            stdout_str.append(f'g={2.0**best_g},')
-            output_str.append(f'log2g={g}')
+            stdout_str.append(f'g={best_hyperparam.g},')
+            output_str.append(f'log2g={hyperparam.log2g}')
 
         if options.grid_with_p:
-            stdout_str.append(f'p={2.0**best_p},')
-            output_str.append(f'log2p={p}')
+            stdout_str.append(f'p={best_hyperparam.p},')
+            output_str.append(f'log2p={hyperparam.log2p}')
 
-        stdout_str.append(f'{options.rate_kind}={best_rate})')
+        stdout_str.append(f'{options.rate_kind}={best_hyperparam.rate})')
         logging.info(" ".join(stdout_str))
         if options.out_pathname and not resumed:
-            output_str.append(f'{options.rate_kind}={rate}\n')
+            output_str.append(f'{options.rate_kind}={hyperparam.rate}\n')
             result_file.write(" ".join(output_str))
             result_file.flush()
 
-        return best_c, best_g, best_p, best_rate
-
-    options = GridOption(params)
+    options = GridOption(**params)
     jobs, resumed_jobs = calculate_jobs(options)
-    gnuplot = pygnuplot.Gnuplot()
 
+    workers = [evaluate_svm_classifier.remote('local', hyperparam, options) for hyperparam in jobs if hyperparam not in resumed_jobs]
 
-    workers = [evaluate.remote('local', c, g, p, options) for (c, g , p) in jobs if (c, g, p) not in resumed_jobs]
-
-    if options.out:
+    if options.with_output:
         if options.resume_pathname:
             result_file = open(options.out_pathname, 'a')
         else:
             result_file = open(options.out_pathname, 'w')
     db = []
-    best_rate = float('+inf') if options.svm_type in [3, 4] else -1
-    best_c, best_g, best_p = None, None, None
-    for (c, g, p) in resumed_jobs:
-        rate = resumed_jobs[(c, g, p)]
-        best_c,best_g,best_p,best_rate = update_param(c, g, p, rate, best_c, best_g, best_p, best_rate, 'resumed', True,options)
-        db.append((c, g, rate))
-        if options.with_gnuplot:
-            redraw(db, [best_c, best_g, best_rate], gnuplot, options)
-            redraw(db, [best_c, best_g, best_rate], gnuplot, options, to_file=True)
+
+    best_hyperparam = GridHyperParameter(None, None, None, float('+inf') if options.svm_type in [3, 4] else -1)
+    for hyperparam in resumed_jobs:
+        best_hyperparam = update_param(hyperparam, best_hyperparam ,options)
+        write_param(hyperparam, best_hyperparam, 'resumed', True ,options)
+        db.append(hyperparam)
+
 
     futs = [worker.future() for worker in workers]
     for fut in concurrent.futures.as_completed(futs):
-        (worker, c, g, p, rate) = fut.result()
-        best_c, best_g, best_p, best_rate = update_param(c,g,p,rate,best_c,best_g,best_p,best_rate,worker,False,options)
-        db.append((c, g, rate))
-        if options.with_gnuplot:
-            redraw(db, [best_c, best_g, best_rate], gnuplot, options)
-            redraw(db, [best_c, best_g, best_rate], gnuplot, options, to_file=True)
+        (worker, hyperparam) = fut.result()
+        best_hyperparam = update_param(hyperparam, best_hyperparam ,options)
+        write_param(hyperparam, best_hyperparam, worker, False, options)
+        db.append(hyperparam)
 
-    if options.out:
+    if options.with_gnuplot:
+        redraw(db, best_hyperparam, options)
+        redraw(db, best_hyperparam, options, to_file=True)
+
+    if options.with_output:
         result_file.close()
 
-    best_param, best_cgp  = {}, []
+    logging.info(f'{" ".join(map(str, (best_hyperparam.c, best_hyperparam.g, best_hyperparam.p)))} {best_hyperparam.rate}')
 
-    if best_c != None:
-        best_param['c'] = 2.0**best_c
-        best_cgp.append(2.0**best_c)
-
-    if best_g != None:
-        best_param['g'] = 2.0**best_g
-        best_cgp.append(2.0**best_g)
-
-    if best_p != None:
-        best_param['p'] = 2.0**best_p
-        best_cgp.append(2.0**best_p)
-
-    logging.info(f'{" ".join(map(str, best_cgp))} {best_rate}')
-
-    return best_rate, best_param
+    return best_hyperparam
 
 
 @click.command()
 @click.argument('dataset', type=click.Path(exists=True))
-@click.option('--svm-type', default=0, help="""\b
+@click.option('--svm-type', 'svm_type', default=0, help="""\b
 set type of SVM (default 0):
 0 -- C-SVC (multi-class classification)
 1 -- nu-SVC (multi-class classification)
 2 -- one-class SVM
 3 -- epsilon-SVR (regression)
 4 -- nu-SVR (regression)""")
-@click.option('--log2c', nargs=3, default=(-1, 6, 1), help='c_range = 2^{begin,...,begin+k*step,...,end}')
-@click.option('--log2g', nargs=3, default=(0, -8, -1), help='g_range = 2^{begin,...,begin+k*step,...,end}')
-@click.option('--log2p', nargs=3, default=(-8, -1, 1), help='p_range = 2^{begin,...,begin+k*step,...,end}')
-@click.option('--c/--no-c', default=True, help='Disable the usage of log2c')
-@click.option('--g/--no-g', default=True, help='Disable the usage of log2g')
-@click.option('--p/--no-p', default=True, help='Disable the usage of log2p')
-@click.option('-v', type=int, default=5, help='n fold validation')
+@click.option('--log2c', 'c_range', nargs=3, default=(-1, 6, 1), help='c_range = 2^{begin,...,begin+k*step,...,end}')
+@click.option('--log2g', 'g_range', nargs=3, default=(0, -8, -1), help='g_range = 2^{begin,...,begin+k*step,...,end}')
+@click.option('--log2p', 'p_range', nargs=3, default=(-8, -1, 1), help='p_range = 2^{begin,...,begin+k*step,...,end}')
+@click.option('--c/--no-c', 'with_c', default=True, help='Disable the usage of log2c')
+@click.option('--g/--no-g', 'with_g', default=True, help='Disable the usage of log2g')
+@click.option('--p/--no-p', 'with_p', default=True, help='Disable the usage of log2p')
+@click.option('-v', 'fold', type=int, default=5, help='n fold validation')
 @click.option('--out-pathname', type=click.Path(), help='set output file path and name')
-@click.option('--out/--no-out', default=True, help='Disable out file')
-@click.option('--resume', type=click.Path(exists=True), help='Existing old out file to resume from.')
+@click.option('--out/--no-out', 'with_output', default=True, help='Disable out file')
+@click.option('--resume', 'resume_pathname', type=click.Path(exists=True), help='Existing old out file to resume from.')
 @click.option('--svm-options', multiple=True, help='additionals svm options')
 @click.option('--nb-process', default=1)
-def main(**params):
+def main(**params: dict[str, object]):
     ray.init()
-    find_parameters(params)
-
-
-if __name__ == '__main__':
-    main()
+    find_parameters(**params)

@@ -12,7 +12,7 @@ import dataclasses
 from itertools import product
 from libsvm import svmutil
 from pygnuplot import gnuplot as pygnuplot
-from typing import NamedTuple
+from typing import Callable, Iterable, Iterator, NamedTuple, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
 
@@ -30,62 +30,75 @@ class GridHyperParameter:
     log2p: float
     rate: float = None
 
-    def __eq__(self, ghp):
+    def __eq__(self, ghp) -> bool:
         return (self.log2c, self.log2g, self.log2p) == (ghp.log2c, ghp.log2g, ghp.log2p)
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash((self.log2c, self.log2g, self.log2p))
 
     @property
-    def c(self):
+    def c(self) -> Optional[float]:
         return 2.0**self.log2c if self.log2c is not None else None
 
     @property
-    def g(self):
+    def g(self) -> Optional[float]:
         return 2.0**self.log2g if self.log2g is not None else None
 
     @property
-    def p(self):
+    def p(self) -> Optional[float]:
         return 2.0**self.log2p if self.log2p is not None else None
 
 
 class GridOption:
 
-    def __init__(self, **options: dict[str, object]):
-        self.fold: int = options["fold"]
-        self.svm_type: int = options['svm_type']
-        self.c_range: GridRange = GridRange(*options['c_range'])
-        self.g_range: GridRange = GridRange(*options['g_range'])
-        self.p_range: GridRange = GridRange(*options['p_range'])
-        self.grid_with_c: bool = options['with_c']
-        self.grid_with_g: bool = options['with_g']
-        self.grid_with_p: bool = options['with_p'] and self.svm_type in [3, 4]
-        self.dataset = svmutil.svm_read_problem(options['dataset'])
-        self.dataset_title: str = os.path.split(options['dataset'])[1]
-        self.with_output: bool = options['with_output']
-        self.out_pathname: str = '{0}.out'.format(self.dataset_title if options['out_pathname'] is None else options['out_pathname'])
-        self.png_pathname: str = '{0}.png'.format(self.dataset_title if options['out_pathname'] is None else options['out_pathname'])
-        self.resume_pathname: str = options['resume_pathname']
-        self.svm_options: str = " ".join(options['svm_options'])
+    DEFAULTS = {
+        "fold": 5,
+        "svm_type": 0,
+        "c_range":(-1, 6, 1),
+        "g_range":(0, -8, -1),
+        "p_range":(-8, -1, 1),
+        "with_c": True,
+        "with_g": True,
+        "with_p": True,
+        "with_output": True,
+        "nb_process": 1
+    }
+
+    def __init__(self, **options: dict[str, object]) -> None:
+        self.fold: int = options.get("fold", self.DEFAULTS.get("fold"))
+        self.svm_type: int = options.get('svm_type', self.DEFAULTS.get("svm_type"))
+        self.c_range: GridRange = GridRange(*options.get('c_range', self.DEFAULTS.get('c_range')))
+        self.g_range: GridRange = GridRange(*options.get('g_range', self.DEFAULTS.get('g_range')))
+        self.p_range: GridRange = GridRange(*options.get('p_range', self.DEFAULTS.get('p_range')))
+        self.grid_with_c: bool = options.get('with_c', self.DEFAULTS.get('with_c'))
+        self.grid_with_g: bool = options.get('with_g', self.DEFAULTS.get('with_g'))
+        self.grid_with_p: bool = options.get('with_p', self.DEFAULTS.get('with_p')) and self.svm_type in [3, 4]
+        self.dataset = svmutil.svm_read_problem(options.get('dataset'))
+        self.dataset_title: str = os.path.split(options.get('dataset'))[1]
+        self.with_output: bool = options.get('with_output', self.DEFAULTS.get("with_output"))
+        self.out_pathname: str = '{0}.out'.format(self.dataset_title if options.get('out_pathname') is None else options.get('out_pathname'))
+        self.png_pathname: str = '{0}.png'.format(self.dataset_title if options.get('out_pathname') is None else options.get('out_pathname'))
+        self.resume_pathname: str = options.get('resume_pathname')
+        self.svm_options: str = " ".join(options.get('svm_options'))
         self.with_gnuplot: bool = self.grid_with_c and self.grid_with_g
-        self.nb_process: int = options['nb_process']
+        self.nb_process: int = options.get('nb_process', self.DEFAULTS.get("nb_process"))
         self.validate_options()
 
-    def validate_options(self):
+    def validate_options(self) -> None :
         if not any([self.grid_with_c, self.grid_with_g, self.grid_with_p]):
             raise ValueError('-c , -g and -p should not be disabled simultaneously')
 
-    def evaluate_rate(self, rate: float, best_rate: float):
+    def evaluate_rate(self, rate: float, best_rate: float) -> bool:
         if self.rate_kind == 'rate':
             return rate > best_rate
         return rate < best_rate
 
     @property
-    def rate_kind(self):
+    def rate_kind(self) -> str:
         return 'mse' if self.svm_type in [3, 4] else 'rate'
 
 
-def redraw(db, best_param, options, to_file=False):
+def redraw(db, best_param, options, to_file=False) -> None:
     gnuplot = pygnuplot.Gnuplot()
 
     if len(db) == 0: return
@@ -138,8 +151,7 @@ def redraw(db, best_param, options, to_file=False):
     gnuplot.flush()
 
 
-def calculate_jobs(options: GridOption):
-
+def calculate_jobs(options: GridOption) -> tuple[Iterator[GridHyperParameter], Iterator[GridHyperParameter]]:
     c_seq = np.random.permutation(np.arange(*options.c_range))
     g_seq = np.random.permutation(np.arange(*options.g_range))
     p_seq = np.random.permutation(np.arange(*options.p_range))
@@ -174,7 +186,7 @@ def calculate_jobs(options: GridOption):
 
 
 @ray.remote
-def evaluate_svm_classifier(name: str, hyperparam: GridHyperParameter, options: GridOption):
+def evaluate_svm_classifier(name: str, hyperparam: GridHyperParameter, options: GridOption) -> tuple[str, GridHyperParameter]:
     cmdline = ['-q', f'-s {options.svm_type}']
 
     if options.grid_with_c:
@@ -191,7 +203,7 @@ def evaluate_svm_classifier(name: str, hyperparam: GridHyperParameter, options: 
     return (name, hyperparam)
 
 
-def update_param(hyperparam: GridHyperParameter, best_hyperparam: GridHyperParameter, options: GridOption):
+def update_param(hyperparam: GridHyperParameter, best_hyperparam: GridHyperParameter, options: GridOption) -> GridHyperParameter:
     if (
         options.evaluate_rate( hyperparam.rate, best_hyperparam.rate )
         or (
@@ -205,7 +217,8 @@ def update_param(hyperparam: GridHyperParameter, best_hyperparam: GridHyperParam
 
     return best_hyperparam
 
-def find_parameters(**params: dict[str, object]):
+
+def find_parameters(**params: dict[str, object]) -> GridHyperParameter:
 
     def write_param(hyperparam: GridHyperParameter, best_hyperparam: GridHyperParameter, worker: str, resumed: bool, options: GridOption):
         stdout_str = [f'[{worker}] {" ".join(str(x) for x in [hyperparam.log2c, hyperparam.log2g, hyperparam.log2p] if x is not None)} {hyperparam.rate} (best']
@@ -269,25 +282,25 @@ def find_parameters(**params: dict[str, object]):
 
 @click.command()
 @click.argument('dataset', type=click.Path(exists=True))
-@click.option('--svm-type', 'svm_type', default=0, help="""\b
+@click.option('--svm-type', 'svm_type', default=GridOption.DEFAULTS.get("svm_type"), help="""\b
 set type of SVM (default 0):
 0 -- C-SVC (multi-class classification)
 1 -- nu-SVC (multi-class classification)
 2 -- one-class SVM
 3 -- epsilon-SVR (regression)
 4 -- nu-SVR (regression)""")
-@click.option('--log2c', 'c_range', nargs=3, default=(-1, 6, 1), help='c_range = 2^{begin,...,begin+k*step,...,end}')
-@click.option('--log2g', 'g_range', nargs=3, default=(0, -8, -1), help='g_range = 2^{begin,...,begin+k*step,...,end}')
-@click.option('--log2p', 'p_range', nargs=3, default=(-8, -1, 1), help='p_range = 2^{begin,...,begin+k*step,...,end}')
-@click.option('--c/--no-c', 'with_c', default=True, help='Disable the usage of log2c')
-@click.option('--g/--no-g', 'with_g', default=True, help='Disable the usage of log2g')
-@click.option('--p/--no-p', 'with_p', default=True, help='Disable the usage of log2p')
-@click.option('-v', 'fold', type=int, default=5, help='n fold validation')
+@click.option('--log2c', 'c_range', nargs=3, default=GridOption.DEFAULTS.get('c_range'), help='c_range = 2^{begin,...,begin+k*step,...,end}')
+@click.option('--log2g', 'g_range', nargs=3, default=GridOption.DEFAULTS.get('g_range'), help='g_range = 2^{begin,...,begin+k*step,...,end}')
+@click.option('--log2p', 'p_range', nargs=3, default=GridOption.DEFAULTS.get('p_range'), help='p_range = 2^{begin,...,begin+k*step,...,end}')
+@click.option('--c/--no-c', 'with_c', default=GridOption.DEFAULTS.get('with_c'), help='Disable the usage of log2c')
+@click.option('--g/--no-g', 'with_g', default=GridOption.DEFAULTS.get('with_g'), help='Disable the usage of log2g')
+@click.option('--p/--no-p', 'with_p', default=GridOption.DEFAULTS.get('with_p'), help='Disable the usage of log2p')
+@click.option('-v', 'fold', type=int, default=GridOption.DEFAULTS.get('fold'), help='n fold validation')
 @click.option('--out-pathname', type=click.Path(), help='set output file path and name')
-@click.option('--out/--no-out', 'with_output', default=True, help='Disable out file')
+@click.option('--out/--no-out', 'with_output', default=GridOption.DEFAULTS.get('with_output'), help='Disable out file')
 @click.option('--resume', 'resume_pathname', type=click.Path(exists=True), help='Existing old out file to resume from.')
 @click.option('--svm-options', multiple=True, help='additionals svm options')
-@click.option('--nb-process', default=1)
+@click.option('--nb-process', default=GridOption.DEFAULTS.get('nb_process'))
 def main(**params: dict[str, object]):
     ray.init()
     find_parameters(**params)

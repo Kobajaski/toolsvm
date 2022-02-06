@@ -15,6 +15,7 @@ ipython = "*"
 black = "*"
 pytest = "*"
 pytest-cov = "*"
+hypothesis = "*"
 
 [requires]
 python_version = "3"
